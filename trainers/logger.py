@@ -47,22 +47,30 @@ def main():
     run_id = runs_df.iloc[0]["run_id"]
     print(f"[Info] Using run id: {run_id}")
 
-    # Optionally, print total training time if logged by the training script.
+    # Retrieve the run object to access single-value metrics.
     run = client.get_run(run_id)
+
+    # Check for final (single-value) metrics that the training script might have logged.
     total_training_time = run.data.metrics.get("total_training_time_s", None)
     if total_training_time is not None:
-        print(f"[Info] Total training time for this run: {total_training_time:.2f} seconds")
+        print(f"[Info] Total training time: {total_training_time:.2f} seconds")
     else:
-        print("[Info] No total training time metric found for this run.")
+        print("[Info] No 'total_training_time_s' metric found for this run.")
 
-    # Define the metrics we want to visualize.
+    total_run_time = run.data.metrics.get("total_run_time_s", None)
+    if total_run_time is not None:
+        print(f"[Info] Total run time: {total_run_time:.2f} seconds")
+    else:
+        print("[Info] No 'total_run_time_s' metric found for this run.")
+
+    # Define the metrics we want to visualize per step.
     metric_names = [
         "train_loss", 
         "val_loss", 
         "iteration_time_ms", 
         "mfu", 
         "tokens_processed", 
-        "tokens_per_second"
+        "tokens_per_second"  # might not exist, but we keep it for completeness
     ]
     
     # Dictionary to hold metric histories.
@@ -76,7 +84,10 @@ def main():
             continue
         steps = [m.step for m in history]
         values = [m.value for m in history]
+
+        # Store the steps/values for later combined plots (e.g., train vs val loss).
         metric_history[metric] = (steps, values)
+
         # Plot the metric.
         plt.figure(figsize=(8, 5))
         plt.plot(steps, values, marker='o', linestyle='-')
