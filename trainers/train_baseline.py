@@ -21,7 +21,7 @@ from tabulate import tabulate  # For printing a nice table
 import argparse
 import math
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Hyperparameters and training settings
 batch_size = 32
 block_size = 512
@@ -42,7 +42,7 @@ use_lr_scheduler = True
 warmup_steps = 50  # for LR warmup
 use_gradient_checkpointing = False
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Data loader for binary shards with improved handling
 class ShardedDataLoader:
     """
@@ -140,7 +140,7 @@ class ShardedDataLoader:
         print(f"[DataLoader-{self.split}] Batch range: min={x.min().item()}, max={x.max().item()}")
         return x, y
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Token decoding helper (using tiktoken)
 def decode(tokens):
     enc = tiktoken.get_encoding("gpt2")
@@ -160,8 +160,7 @@ def decode(tokens):
     # Join everything into one string
     return "".join(decoded_pieces)
 
-
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Model Configuration and Components
 @dataclass
 class Config:
@@ -176,44 +175,6 @@ class Config:
     use_gradient_checkpointing: bool = use_gradient_checkpointing
     # For MoE load-balancing
     moe_load_balancing_weight: float = 0.01
-
-# ----------------- Rotary Embeddings and RMSNorm ----------------------------
-class Rotary(nn.Module):
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def forward(self, x):
-        seq_len = x.shape[2]
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos()[None, None, :, :]
-            self.sin_cached = freqs.sin()[None, None, :, :]
-        return self.cos_cached, self.sin_cached
-
-def apply_rotary_emb(x, cos, sin):
-    d = x.shape[-1] // 2
-    x1 = x[..., :d]
-    x2 = x[..., d:]
-    new_x1 = x1 * cos + x2 * sin
-    new_x2 = -x1 * sin + x2 * cos
-    return torch.cat([new_x1, new_x2], dim=-1)
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        return self.weight * (x / rms)
 
 # ----------------- Model Components -----------------------------------------
 class CausalSelfAttention(nn.Module):
@@ -232,8 +193,7 @@ class CausalSelfAttention(nn.Module):
             'bias',
             torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
         )
-
-        self.rotary = Rotary(self.head_dim)
+        # Rotary embeddings removed; using raw queries and keys
 
     def forward(self, x, past_kv=None):
         B, T, C = x.size()
@@ -243,10 +203,6 @@ class CausalSelfAttention(nn.Module):
         query = query.view(B, T, self.n_head, self.head_dim).transpose(1,2)
         key   = key.view(B, T, self.n_head, self.head_dim).transpose(1,2)
         value = value.view(B, T, self.n_head, self.head_dim).transpose(1,2)
-
-        cos, sin = self.rotary(query)
-        query = apply_rotary_emb(query, cos, sin)
-        key   = apply_rotary_emb(key, cos, sin)
 
         if past_kv is not None:
             pk, pv = past_kv
@@ -287,21 +243,21 @@ class NoisyTopkRouter(nn.Module):
 
     def forward(self, x):
         logits = self.topkroute_linear(x)      # (B, T, num_experts)
-        noise_logits = self.noise_linear(x)    # (B, T, num_experts)
+        noise_logits = self.noise_linear(x)      # (B, T, num_experts)
         noise_stddev = F.softplus(noise_logits)
         noise = torch.randn_like(logits) * noise_stddev
         noisy_logits = logits + noise
 
-        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)  # (B,T,k), (B,T,k)
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)  # (B, T, k), (B, T, k)
         zeros = torch.full_like(noisy_logits, float('-inf'))
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
-        router_output = F.softmax(sparse_logits, dim=-1)  # (B,T,num_experts)
+        router_output = F.softmax(sparse_logits, dim=-1)  # (B, T, num_experts)
         return router_output, indices
 
 def moe_load_balancing_loss(gates: torch.Tensor):
     """
-    Very simple load-balancing loss: we want each expert to receive
-    roughly the same fraction of tokens. gates is shape (B,T,num_experts).
+    Simple load-balancing loss: we want each expert to receive roughly the same fraction of tokens.
+    gates is shape (B, T, num_experts).
     """
     expert_fraction = gates.mean(dim=(0,1))  # shape (num_experts,)
     num_experts = gates.size(-1)
@@ -321,7 +277,7 @@ class SparseMoE(nn.Module):
 
     def forward(self, x):
         B, T, C = x.shape
-        gating_output, indices = self.router(x)  # (B,T,E), (B,T,k)
+        gating_output, indices = self.router(x)  # (B, T, num_experts), (B, T, k)
 
         final_output = torch.zeros_like(x)
         flat_x = x.view(-1, C)
@@ -334,7 +290,7 @@ class SparseMoE(nn.Module):
         lb_loss = moe_load_balancing_loss(gating_output)
 
         for i, expert in enumerate(self.experts):
-            expert_mask = (indices == i).any(dim=-1)  # (B,T)
+            expert_mask = (indices == i).any(dim=-1)  # (B, T)
             flat_mask = expert_mask.view(-1)
 
             selected_indices = torch.nonzero(flat_mask).squeeze(-1)
@@ -352,6 +308,7 @@ class SparseMoE(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
+        # Use LayerNorm everywhere instead of RMSNorm
         self.layer_norm_1 = nn.LayerNorm(config.n_embed)
         self.attention = CausalSelfAttention(config)
         self.layer_norm_2 = nn.LayerNorm(config.n_embed)
@@ -359,10 +316,10 @@ class Block(nn.Module):
         self.config = config
 
     def forward_fn(self, x):
-        # sub-layer 1
+        # sub-layer 1: self-attention
         a_out, _ = self.attention(self.layer_norm_1(x))
         x = x + a_out
-        # sub-layer 2
+        # sub-layer 2: MoE layer
         moe_in = self.layer_norm_2(x)
         moe_out, moe_loss = self.moe(moe_in)
         x = x + moe_out
@@ -417,12 +374,12 @@ class GPT(nn.Module):
         total_moe_loss = 0.0
         new_past_kv = []
         for block, pkv in zip(self.transformer.h, past_kv):
-            # first sub-layer (attention)
+            # First sub-layer: attention
             a_in = block.layer_norm_1(x)
             attn_out, updated_kv = block.attention(a_in, pkv)
             x = x + attn_out
 
-            # second sub-layer (moe)
+            # Second sub-layer: MoE
             moe_in = block.layer_norm_2(x)
             moe_out, moe_loss = block.moe(moe_in)
             x = x + moe_out
@@ -452,7 +409,7 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Print stats about data
 def print_data_stats(files, B, T):
     total_tokens = 0
@@ -469,7 +426,7 @@ def print_data_stats(files, B, T):
     ]
     print("\n" + tabulate(table_data, headers=["Metric", "Value"], tablefmt="fancy_grid") + "\n")
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
 # Main Training Loop with an Optional Profiler
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GPT MoE Training")
@@ -620,7 +577,7 @@ if __name__ == "__main__":
                     mlflow.log_text(gen_text, f"gen_text_step_{i}.txt")
 
         if args.enable_profiling:
-            # Profiling schedule: skip 2 steps, then warm up 2 steps, then profile 5 steps
+            # Profiling schedule: skip 2 steps, warm up 2 steps, then profile 5 steps
             schedule = torch.profiler.schedule(wait=2, warmup=2, active=5)
             with torch.profiler.profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -692,8 +649,6 @@ if __name__ == "__main__":
                             mlflow.log_metric("mfu", mfu, step=step_idx)
                             mlflow.log_metric("tokens_processed", tokens_processed, step=step_idx)
 
-                        # Periodic generation
-                       
                         # Move profiler through wait/warmup/active stages
                         prof.step()
 
