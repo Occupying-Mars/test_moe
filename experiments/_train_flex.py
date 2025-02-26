@@ -644,5 +644,3 @@ if __name__ == "__main__":
     print(generated_text)
     with open("output.txt", "w", encoding='utf-8') as f:
         f.write(generated_text)
-# git config --global user.email "chinmaykarkar7@gmail.com"
-#   git config --global user.name "ChinmayK0607"
