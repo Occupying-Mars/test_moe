@@ -286,7 +286,7 @@ class CausalSelfAttention(nn.Module):
         if flash_attn is not None:
             attn_output = flash_attn(query, key, value, dropout_p=0.0, causal=True)
         else:
-            attn_output = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask)
+            attn_output = flex_attention(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), block_mask=block_mask)
         attn_output = attn_output.transpose(1,2).contiguous().view_as(x)
         attn_output = self.c_proj(attn_output)
         return attn_output, v1
@@ -461,7 +461,7 @@ class GPT(nn.Module):
             v1 = None
             skip_connections = []
             for i in range(self.encoder_layers):
-                x, v1 = self.transformer.h[i](x, x0, v1)
+                x, v1 = self.transformer.h[i](x, x0, block_mask, v1)
                 skip_connections.append(x)
             for i in range(self.decoder_layers):
                 skip = skip_connections.pop()
@@ -644,3 +644,5 @@ if __name__ == "__main__":
     print(generated_text)
     with open("output.txt", "w", encoding='utf-8') as f:
         f.write(generated_text)
+# git config --global user.email "chinmaykarkar7@gmail.com"
+#   git config --global user.name "ChinmayK0607"
