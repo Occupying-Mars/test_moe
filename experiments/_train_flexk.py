@@ -93,7 +93,7 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(query)
         query = apply_rotary_emb(query, cos, sin)
         key   = apply_rotary_emb(key, cos, sin)
-        
+        value = value.to(torch.float32)
         if mask_mod is None:
             mask_mod = causal_mask
         block_mask = create_block_mask(mask_mod, B, self.n_head, T, T, device=x.device)
