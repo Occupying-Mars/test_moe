@@ -402,6 +402,153 @@ def test_flex_attention_windowed(device):
     else:
         print("[Test] Warning: FlexAttention does not match standard attention for windowed mask.")
 
+# Add Muon optimizer implementation
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
+    Uses quintic iteration with coefficients optimized for slope at zero.
+    """
+    assert G.ndim == 2
+    # Optimal coefficients from research
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    
+    # Convert to bfloat16 for better speed/memory tradeoff
+    X = G.bfloat16()
+    
+    # Handle rectangular matrices - work with smaller dimension
+    transposed = (X.shape[0] > X.shape[1])
+    if transposed:
+        X = X.T
+        
+    # Normalize to unit Frobenius norm
+    X = X / (X.norm() + eps)
+    
+    # Newton-Schulz iteration with quintic computation
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A  # Optimized quintic computation
+        X = a * X + B @ X
+    
+    # Transpose back if needed
+    if transposed:
+        X = X.T
+        
+    return X.to(G.dtype)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+    
+    Internally runs SGD-momentum, then performs orthogonalization post-processing
+    on each 2D parameter's update using an efficient Newton-Schulz iteration.
+    """
+    def __init__(self, params, lr=6e-4 * 0.1, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+        self.orthogonalization_count = 0
+        self.step_count = 0
+        self.failed_ortho_count = 0
+
+    @torch.no_grad()
+    def step(self):
+        self.step_count += 1
+        ortho_this_step = 0
+        failed_this_step = 0
+        
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            nesterov = group['nesterov']
+            ns_steps = group['ns_steps']
+            
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                    
+                grad = p.grad
+                state = self.state[p]
+                
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(grad)
+                buf = state['momentum_buffer']
+                
+                # Momentum update
+                buf.lerp_(grad, 1 - momentum)  # More numerically stable than mul/add
+                if nesterov:
+                    grad = grad.lerp_(buf, momentum)
+                else:
+                    grad = buf
+                    
+                # Orthogonalize 2D parameters
+                if grad.ndim == 2 and grad.size(0) > 1 and grad.size(1) > 1:
+                    try:
+                        grad_ortho = zeropower_via_newtonschulz5(grad, steps=ns_steps)
+                        
+                        # Scale update based on matrix dimensions
+                        scale = max(grad.size(0), grad.size(1)) ** 0.5
+                        p.add_(grad_ortho, alpha=-lr * scale)
+                        ortho_this_step += 1
+                        
+                    except RuntimeError:
+                        failed_this_step += 1
+                        # Fallback with reduced learning rate
+                        p.add_(grad, alpha=-lr * 0.1)
+                else:
+                    p.add_(grad, alpha=-lr)
+        
+        self.orthogonalization_count += ortho_this_step
+        self.failed_ortho_count += failed_this_step
+        
+        # Log every 10 steps
+        if self.step_count % 10 == 0:
+            print(f"[Muon] Step {self.step_count}:")
+            print(f"  Orthogonalized: {ortho_this_step} matrices (Total: {self.orthogonalization_count})")
+            if failed_this_step > 0:
+                print(f"  Failed: {failed_this_step} matrices (Total: {self.failed_ortho_count})")
+
+# Update test function
+def test_orthogonalization(device):
+    print("[Test] Testing Muon orthogonalization...")
+    torch.manual_seed(42)  # For reproducibility
+    
+    sizes = [(384, 384), (1152, 384), (1536, 384)]
+    
+    for m, n in sizes:
+        print(f"\nTesting {m}x{n} matrix:")
+        test_matrix = torch.randn(m, n, device=device)
+        
+        # Test initial condition
+        print(f"  Initial matrix norm: {torch.norm(test_matrix).item():.6f}")
+        
+        # Perform orthogonalization
+        ortho_matrix = zeropower_via_newtonschulz5(test_matrix)
+        
+        # Check orthogonality
+        if m >= n:
+            prod = ortho_matrix.T @ ortho_matrix
+            identity = torch.eye(n, device=device)
+        else:
+            prod = ortho_matrix @ ortho_matrix.T
+            identity = torch.eye(m, device=device)
+            
+        error = torch.norm(prod - identity).item()
+        print(f"  Orthogonality error (Frobenius norm): {error:.6f}")
+        
+        # Check matrix norm
+        norm = torch.norm(ortho_matrix).item()
+        print(f"  Final matrix norm: {norm:.6f}")
+        
+        # Check singular values
+        with torch.no_grad():
+            U, S, Vh = torch.linalg.svd(ortho_matrix)
+            sv_diff = (S - torch.ones_like(S[:min(m,n)])).abs().max().item()
+            print(f"  Max singular value deviation from 1: {sv_diff:.6f}")
+            print(f"  Singular values: {S[:5].tolist()}")  # Show first 5
+        
+        # Overall status
+        passed = error < 0.1 and abs(norm - 1.0) < 0.1 and sv_diff < 0.1
+        print(f"  Status: {'PASSED' if passed else 'FAILED'}")
+
 # Main Training Script
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GPT Training with FlexAttention")
@@ -427,7 +574,22 @@ if __name__ == "__main__":
     scaler = torch.amp.GradScaler('cuda')
     model = torch.compile(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    # Split parameters into Muon and AdamW groups
+    muon_params = []
+    adam_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 2 and ("wte." not in name) and ("lm_head." not in name):
+            muon_params.append(param)
+        else:
+            adam_params.append(param)
+
+    optimizer_muon = Muon(muon_params, 
+                         lr=learning_rate * 0.1,  # Use 1/10th of base learning rate
+                         momentum=0.95,
+                         ns_steps=5)
+    optimizer_adam = torch.optim.AdamW(adam_params, lr=learning_rate)
 
     data_dir = "finewebedu10B"
     train_loader = ShardedDataLoader(data_dir, "finewebedu_train_*.bin", batch_size, config.block_size, split="train")
@@ -438,22 +600,37 @@ if __name__ == "__main__":
         print("[Training] Starting training loop...")
         start_time = time.time()
 
+        # Fix the parameter shape printing
+        print("\n[Optimizer Setup]")
+        print(f"Muon parameters: {len(muon_params)}")
+        print(f"AdamW parameters: {len(adam_params)}")
+        print("Muon parameter shapes:")
+        for name, param in model.named_parameters():
+            if any(id(p) == id(param) for p in muon_params):  # Compare by identity instead
+                print(f"  {name}: {param.shape}")
+
+        # Add orthogonalization test
+        test_orthogonalization(device)
+
         for i in tqdm(range(max_iters), desc="Training"):
             iter_start = time.time()
             x, y = train_loader.next_batch()
             x, y = x.to(device), y.to(device)
             
-            optimizer.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adam.zero_grad(set_to_none=True)
             
-            # Use autocast for forward pass
             with torch.amp.autocast(device_type=device, dtype=torch.float16, enabled=(device=="cuda")):
                 logits, loss = model(x, y)
             
-            # Scale loss and compute gradients
             scaler.scale(loss).backward()
             
-            # Unscale gradients and step optimizer
-            scaler.step(optimizer)
+            # Momentum warmup over first 500 steps
+            frac = min(i / 500, 1)
+            optimizer_muon.param_groups[0]['momentum'] = (1 - frac) * 0.85 + frac * 0.95
+            
+            scaler.step(optimizer_muon)
+            scaler.step(optimizer_adam)
             scaler.update()
             
             iter_time = time.time() - iter_start
@@ -468,6 +645,20 @@ if __name__ == "__main__":
                 print(f"[Training] Step {i}: Loss={loss.item():.4f}, ValLoss={v_loss.item():.4f}, IterTime={iter_time*1000:.2f} ms")
                 mlflow.log_metric("train_loss", loss.item(), step=i)
                 mlflow.log_metric("val_loss", v_loss.item(), step=i)
+                
+                # Add Muon monitoring
+                current_momentum = optimizer_muon.param_groups[0]['momentum']
+                print(f"[Muon] Current momentum: {current_momentum:.4f}")
+                
+                # Check orthogonality of a sample parameter
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if "c_proj.weight" in name:  # Check one attention projection matrix
+                            prod = param @ param.T
+                            identity = torch.eye(param.size(0), device=param.device)
+                            error = (prod - identity).abs().max().item()
+                            print(f"[Muon] Sample matrix orthogonality error: {error:.6f}")
+                            break
             
             if i % 100 == 0:
                 context = torch.zeros((1, 1), dtype=torch.long, device=device)
